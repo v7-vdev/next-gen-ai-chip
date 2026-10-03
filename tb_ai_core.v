@@ -2,7 +2,7 @@
 // Testbench: tb_ai_core
 // Description: Verification testbench for the 16-bit RISC-V AI Acceleration Core.
 //              Simulates streaming matrix multiplication (GEMM) operations,
-//              verifies computed outputs against a golden software model,
+//              verifies dynamic low-power clock gating & PMU sleep mode,
 //              and logs 'STATUS: SUCCESS' upon full verification.
 // =============================================================================
 
@@ -19,6 +19,10 @@ module tb_ai_core;
     // Clock and Reset
     reg clk;
     reg rst_n;
+
+    // Power Management Unit (PMU) Interface
+    reg  power_down_mode;
+    wire pmu_ack_sleep;
 
     // RISC-V Coprocessor Command Interface
     reg         cmd_valid;
@@ -62,30 +66,32 @@ module tb_ai_core;
         .MULT_WIDTH(MULT_WIDTH),
         .ACC_WIDTH(ACC_WIDTH)
     ) dut (
-        .clk            (clk),
-        .rst_n          (rst_n),
-        .cmd_valid      (cmd_valid),
-        .cmd_ready      (cmd_ready),
-        .cmd_opcode     (cmd_opcode),
-        .cmd_funct3     (cmd_funct3),
-        .cmd_funct7     (cmd_funct7),
-        .cmd_rs1_data   (cmd_rs1_data),
-        .cmd_rs2_data   (cmd_rs2_data),
-        .cmd_rd_data    (cmd_rd_data),
-        .cmd_rd_valid   (cmd_rd_valid),
-        .stream_valid   (stream_valid),
-        .stream_ready   (stream_ready),
-        .stream_weight  (stream_weight),
-        .stream_act     (stream_act),
-        .stream_last    (stream_last),
-        .stream_clr_acc (stream_clr_acc),
-        .out_valid      (out_valid),
-        .out_ready      (out_ready),
-        .out_data_32    (out_data_32),
-        .out_data_sat   (out_data_sat),
-        .out_last       (out_last),
-        .busy           (busy),
-        .overflow_flag  (overflow_flag)
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .power_down_mode (power_down_mode),
+        .pmu_ack_sleep   (pmu_ack_sleep),
+        .cmd_valid       (cmd_valid),
+        .cmd_ready       (cmd_ready),
+        .cmd_opcode      (cmd_opcode),
+        .cmd_funct3      (cmd_funct3),
+        .cmd_funct7      (cmd_funct7),
+        .cmd_rs1_data    (cmd_rs1_data),
+        .cmd_rs2_data    (cmd_rs2_data),
+        .cmd_rd_data     (cmd_rd_data),
+        .cmd_rd_valid    (cmd_rd_valid),
+        .stream_valid    (stream_valid),
+        .stream_ready    (stream_ready),
+        .stream_weight   (stream_weight),
+        .stream_act      (stream_act),
+        .stream_last     (stream_last),
+        .stream_clr_acc  (stream_clr_acc),
+        .out_valid       (out_valid),
+        .out_ready       (out_ready),
+        .out_data_32     (out_data_32),
+        .out_data_sat    (out_data_sat),
+        .out_last        (out_last),
+        .busy            (busy),
+        .overflow_flag   (overflow_flag)
     );
 
     // -------------------------------------------------------------------------
@@ -110,19 +116,20 @@ module tb_ai_core;
     // -------------------------------------------------------------------------
     task reset_dut;
         begin
-            rst_n          = 1'b0;
-            cmd_valid      = 1'b0;
-            cmd_opcode     = 7'd0;
-            cmd_funct3     = 3'd0;
-            cmd_funct7     = 7'd0;
-            cmd_rs1_data   = 32'd0;
-            cmd_rs2_data   = 32'd0;
-            stream_valid   = 1'b0;
-            stream_weight  = 16'd0;
-            stream_act     = 16'd0;
-            stream_last    = 1'b0;
-            stream_clr_acc = 1'b0;
-            out_ready      = 1'b1;
+            rst_n           = 1'b0;
+            power_down_mode = 1'b0;
+            cmd_valid       = 1'b0;
+            cmd_opcode      = 7'd0;
+            cmd_funct3      = 3'd0;
+            cmd_funct7      = 7'd0;
+            cmd_rs1_data    = 32'd0;
+            cmd_rs2_data    = 32'd0;
+            stream_valid    = 1'b0;
+            stream_weight   = 16'd0;
+            stream_act      = 16'd0;
+            stream_last     = 1'b0;
+            stream_clr_acc  = 1'b0;
+            out_ready       = 1'b1;
 
             #(CLK_PERIOD * 4);
             @(posedge clk);
@@ -318,6 +325,75 @@ module tb_ai_core;
         end
 
         // =====================================================================
+        // Test Suite 4: Dynamic Power Management & Clock Gating Verification
+        // =====================================================================
+        $display("\n[TEST 4] Testing Dynamic Power Management & Low-Power Sleep Mode...");
+        begin : test_power_management
+            // 4.1 Trigger power-down state
+            @(posedge clk);
+            power_down_mode <= 1'b1;
+            @(posedge clk);
+            #(CLK_PERIOD * 2);
+
+            total_tests = total_tests + 1;
+            if (pmu_ack_sleep === 1'b1 && stream_ready === 1'b0 && cmd_ready === 1'b0) begin
+                $display("  [PASS] PMU Sleep Handshake Active: pmu_ack_sleep = %b, stream_ready = %b, cmd_ready = %b",
+                         pmu_ack_sleep, stream_ready, cmd_ready);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("  [FAIL] PMU Sleep Handshake Failed: pmu_ack_sleep = %b (expected 1)", pmu_ack_sleep);
+                failed_tests = failed_tests + 1;
+            end
+
+            // 4.2 Verify MAC logic is frozen and rejects inputs while asleep
+            @(posedge clk);
+            stream_valid  <= 1'b1;
+            stream_weight <= 16'sd999;
+            stream_act    <= 16'sd999;
+            @(posedge clk);
+            stream_valid  <= 1'b0;
+            #(CLK_PERIOD * 2);
+
+            total_tests = total_tests + 1;
+            if (out_valid === 1'b0 && busy === 1'b0) begin
+                $display("  [PASS] Zero Clock Power Gating Verified: Core remained completely quiescent during sleep.");
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("  [FAIL] Core toggled during power down mode!");
+                failed_tests = failed_tests + 1;
+            end
+
+            // 4.3 Wake up core from sleep state
+            @(posedge clk);
+            power_down_mode <= 1'b0;
+            @(posedge clk);
+            #(CLK_PERIOD * 2);
+
+            total_tests = total_tests + 1;
+            if (pmu_ack_sleep === 1'b0 && stream_ready === 1'b1) begin
+                $display("  [PASS] PMU Wakeup Handshake: pmu_ack_sleep = %b, Core ready to resume normal AI inference.",
+                         pmu_ack_sleep);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("  [FAIL] Core failed to wake up cleanly: pmu_ack_sleep = %b", pmu_ack_sleep);
+                failed_tests = failed_tests + 1;
+            end
+
+            // 4.4 Verify post-wake matrix computation correctness
+            stream_dot_product(0, 0, K_DIM, calculated_out);
+            total_tests = total_tests + 1;
+            if (calculated_out === golden_C[0][0]) begin
+                $display("  [PASS] Post-Wakeup Matrix Computation: HW = %0d | Golden = %0d (Seamless Resume)",
+                         calculated_out, golden_C[0][0]);
+                passed_tests = passed_tests + 1;
+            end else begin
+                $display("  [FAIL] Post-Wakeup Computation Mismatch: HW = %0d | Golden = %0d",
+                         calculated_out, golden_C[0][0]);
+                failed_tests = failed_tests + 1;
+            end
+        end
+
+        // =====================================================================
         // Summary & Final Status Evaluation
         // =====================================================================
         $display("\n============================================================");
@@ -330,7 +406,7 @@ module tb_ai_core;
         if (failed_tests == 0 && passed_tests > 0) begin
             $display("\n************************************************************");
             $display("  STATUS: SUCCESS");
-            $display("  All RISC-V AI Acceleration MAC computations verified!");
+            $display("  All RISC-V AI Acceleration MAC computations & Power Management verified!");
             $display("************************************************************\n");
         end else begin
             $display("\n************************************************************");

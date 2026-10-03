@@ -3,13 +3,12 @@
 // Description: Synthesizable 16-bit Matrix Multiply-Accumulate (MAC) Acceleration
 //              Engine tailored for RISC-V Custom Coprocessor Interfaces & AI Workloads.
 //
-// Features:
-//   - 16-bit signed INT16 / Fixed-Point multiply-accumulate unit
-//   - High-throughput streaming data interface for weights and activations
-//   - 40-bit accumulator precision to prevent overflow over deep inner-products
-//   - Configurable saturation, rounding, and activation (ReLU / Linear)
-//   - RISC-V Coprocessor Command Interface (Custom-0 instruction decode)
-//   - Fully synchronous, synthesizable RTL architecture
+// Low-Power VLSI Enhancements:
+//   - Architectural Clock Gating & Dynamic Power Management
+//   - Input pin `power_down_mode` freezes internal MAC pipeline to 0 dynamic power
+//   - Output handshake flag `pmu_ack_sleep` validates safe low-power sleep state
+//   - Glitch-free Integrated Clock Gating (ICG) cell behavioral model
+//   - State-retention sleep capability preserving accumulator across power transitions
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -23,16 +22,22 @@ module ai_core #(
     input  wire                   rst_n,
 
     // -------------------------------------------------------------------------
+    // Power Management Unit (PMU) Interface
+    // -------------------------------------------------------------------------
+    input  wire                   power_down_mode,    // 1: Freeze MAC core into 0-dynamic-power sleep
+    output reg                    pmu_ack_sleep,      // 1: PMU Acknowledge that sleep mode is active
+
+    // -------------------------------------------------------------------------
     // RISC-V Coprocessor Interface (Decoded Instruction / Control)
     // -------------------------------------------------------------------------
     input  wire                   cmd_valid,
     output wire                   cmd_ready,
-    input  wire [6:0]             cmd_opcode,     // 7'b0001011 (Custom-0)
-    input  wire [2:0]             cmd_funct3,    // Sub-operation select
-    input  wire [6:0]             cmd_funct7,    // Function modifier
-    input  wire [31:0]            cmd_rs1_data,   // Scalar/Operand 1 or Weight
-    input  wire [31:0]            cmd_rs2_data,   // Scalar/Operand 2 or Activation
-    output reg  [31:0]            cmd_rd_data,    // Result returned to RISC-V register
+    input  wire [6:0]             cmd_opcode,         // 7'b0001011 (Custom-0)
+    input  wire [2:0]             cmd_funct3,         // Sub-operation select
+    input  wire [6:0]             cmd_funct7,         // Function modifier
+    input  wire [31:0]            cmd_rs1_data,       // Scalar/Operand 1 or Weight
+    input  wire [31:0]            cmd_rs2_data,       // Scalar/Operand 2 or Activation
+    output reg  [31:0]            cmd_rd_data,        // Result returned to RISC-V register
     output reg                    cmd_rd_valid,
 
     // -------------------------------------------------------------------------
@@ -40,18 +45,18 @@ module ai_core #(
     // -------------------------------------------------------------------------
     input  wire                   stream_valid,
     output wire                   stream_ready,
-    input  wire signed [DATA_WIDTH-1:0] stream_weight,     // 16-bit signed weight
-    input  wire signed [DATA_WIDTH-1:0] stream_act,        // 16-bit signed activation
-    input  wire                   stream_last,       // End of row / vector dot-product
-    input  wire                   stream_clr_acc,    // Explicit clear accumulator
+    input  wire signed [DATA_WIDTH-1:0] stream_weight, // 16-bit signed weight
+    input  wire signed [DATA_WIDTH-1:0] stream_act,    // 16-bit signed activation
+    input  wire                   stream_last,        // End of row / vector dot-product
+    input  wire                   stream_clr_acc,     // Explicit clear accumulator
 
     // -------------------------------------------------------------------------
     // Engine Output Interface
     // -------------------------------------------------------------------------
     output reg                    out_valid,
     input  wire                   out_ready,
-    output reg  signed [31:0]     out_data_32,       // Full 32-bit accumulator result
-    output reg  signed [15:0]     out_data_sat,      // 16-bit saturated / activated
+    output reg  signed [31:0]     out_data_32,        // Full 32-bit accumulator result
+    output reg  signed [15:0]     out_data_sat,       // 16-bit saturated / activated
     output reg                    out_last,
     output wire                   busy,
     output reg                    overflow_flag
@@ -69,6 +74,30 @@ module ai_core #(
     localparam FUNCT3_READ_SAT   = 3'b100; // Read 16-bit saturated/ReLU result
 
     // =========================================================================
+    // Dynamic Power Management & Clock Gating Architecture
+    // =========================================================================
+    // Enable signal for internal MAC core clocks (active when not in power-down)
+    wire core_clk_en = !power_down_mode && rst_n;
+
+    // Glitch-Free Integrated Clock Gating (ICG) Cell Behavioral Model
+    // Latch is transparent when clk is LOW, holding state when clk is HIGH.
+    reg clk_gate_latch;
+    always @(clk or core_clk_en) begin
+        if (!clk)
+            clk_gate_latch <= core_clk_en;
+    end
+    wire gated_mac_clk = clk & clk_gate_latch;
+
+    // PMU Sleep Acknowledge Handshake Register
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pmu_ack_sleep <= 1'b0;
+        end else begin
+            pmu_ack_sleep <= power_down_mode;
+        end
+    end
+
+    // =========================================================================
     // Control & Configuration Registers
     // =========================================================================
     reg        cfg_relu_en;
@@ -82,20 +111,20 @@ module ai_core #(
     wire                         clr_accumulator;
     wire                         step_last;
 
-    wire is_coproc_mac = cmd_valid && (cmd_opcode == OPCODE_CUSTOM_0) && (cmd_funct3 == FUNCT3_MAC_STEP);
-    wire is_coproc_clr = cmd_valid && (cmd_opcode == OPCODE_CUSTOM_0) && (cmd_funct3 == FUNCT3_CLEAR);
+    wire is_coproc_mac = !power_down_mode && cmd_valid && (cmd_opcode == OPCODE_CUSTOM_0) && (cmd_funct3 == FUNCT3_MAC_STEP);
+    wire is_coproc_clr = !power_down_mode && cmd_valid && (cmd_opcode == OPCODE_CUSTOM_0) && (cmd_funct3 == FUNCT3_CLEAR);
 
-    assign cmd_ready = !busy || (cmd_opcode == OPCODE_CUSTOM_0 && cmd_funct3 != FUNCT3_MAC_STEP);
-    assign stream_ready = (!busy || out_ready) && !is_coproc_mac;
+    assign cmd_ready    = !power_down_mode && (!busy || (cmd_opcode == OPCODE_CUSTOM_0 && cmd_funct3 != FUNCT3_MAC_STEP));
+    assign stream_ready = !power_down_mode && (!busy || out_ready) && !is_coproc_mac;
 
     assign selected_weight = is_coproc_mac ? cmd_rs1_data[DATA_WIDTH-1:0] : stream_weight;
     assign selected_act    = is_coproc_mac ? cmd_rs2_data[DATA_WIDTH-1:0] : stream_act;
-    assign mac_enable      = is_coproc_mac ? 1'b1 : (stream_valid && stream_ready);
-    assign clr_accumulator = is_coproc_clr || (stream_valid && stream_clr_acc);
-    assign step_last       = is_coproc_mac ? cmd_funct7[0] : (stream_valid && stream_last);
+    assign mac_enable      = !power_down_mode && (is_coproc_mac ? 1'b1 : (stream_valid && stream_ready));
+    assign clr_accumulator = !power_down_mode && (is_coproc_clr || (stream_valid && stream_clr_acc));
+    assign step_last       = !power_down_mode && (is_coproc_mac ? cmd_funct7[0] : (stream_valid && stream_last));
 
     // =========================================================================
-    // Pipeline Stage 1: Operand Latch & Sign Preservation
+    // Pipeline Stage 1: Operand Latch & Sign Preservation (Gated Clock)
     // =========================================================================
     reg signed [DATA_WIDTH-1:0] s1_weight;
     reg signed [DATA_WIDTH-1:0] s1_act;
@@ -103,7 +132,7 @@ module ai_core #(
     reg                         s1_clr;
     reg                         s1_last;
 
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge gated_mac_clk or negedge rst_n) begin
         if (!rst_n) begin
             s1_weight <= {DATA_WIDTH{1'b0}};
             s1_act    <= {DATA_WIDTH{1'b0}};
@@ -122,14 +151,14 @@ module ai_core #(
     end
 
     // =========================================================================
-    // Pipeline Stage 2: 16-bit Signed Multiplier
+    // Pipeline Stage 2: 16-bit Signed Multiplier (Gated Clock)
     // =========================================================================
     reg signed [MULT_WIDTH-1:0] s2_product;
     reg                         s2_valid;
     reg                         s2_clr;
     reg                         s2_last;
 
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge gated_mac_clk or negedge rst_n) begin
         if (!rst_n) begin
             s2_product <= {MULT_WIDTH{1'b0}};
             s2_valid   <= 1'b0;
@@ -148,7 +177,7 @@ module ai_core #(
     end
 
     // =========================================================================
-    // Pipeline Stage 3: 40-bit Accumulator with Sign-Extension
+    // Pipeline Stage 3: 40-bit Accumulator with Sign-Extension (Gated Clock)
     // =========================================================================
     reg signed [ACC_WIDTH-1:0] accumulator;
     wire signed [ACC_WIDTH-1:0] product_ext = {{ (ACC_WIDTH-MULT_WIDTH){s2_product[MULT_WIDTH-1]} }, s2_product};
@@ -156,7 +185,7 @@ module ai_core #(
     reg s3_valid;
     reg s3_last;
 
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge gated_mac_clk or negedge rst_n) begin
         if (!rst_n) begin
             accumulator   <= {ACC_WIDTH{1'b0}};
             overflow_flag <= 1'b0;
@@ -207,9 +236,9 @@ module ai_core #(
     end
 
     // =========================================================================
-    // Output Registers & Handshaking
+    // Output Registers & Handshaking (Gated Clock)
     // =========================================================================
-    always @(posedge clk or negedge rst_n) begin
+    always @(posedge gated_mac_clk or negedge rst_n) begin
         if (!rst_n) begin
             out_valid    <= 1'b0;
             out_last     <= 1'b0;
@@ -228,10 +257,10 @@ module ai_core #(
         end
     end
 
-    assign busy = s1_valid || s2_valid || s3_valid;
+    assign busy = !power_down_mode && (s1_valid || s2_valid || s3_valid);
 
     // =========================================================================
-    // RISC-V Coprocessor Instruction Handling
+    // RISC-V Coprocessor Instruction Handling (Host Clock Domain)
     // =========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -240,7 +269,7 @@ module ai_core #(
             cfg_relu_en      <= 1'b0;
             cfg_shift_right  <= 5'd0;
             streaming_active <= 1'b0;
-        end else begin
+        end else if (!power_down_mode) begin
             cmd_rd_valid <= 1'b0;
             if (cmd_valid && (cmd_opcode == OPCODE_CUSTOM_0)) begin
                 case (cmd_funct3)
@@ -264,7 +293,6 @@ module ai_core #(
                         cmd_rd_valid <= 1'b1;
                     end
                     FUNCT3_MAC_STEP: begin
-                        // Acknowledged via busy / pipeline
                         cmd_rd_valid <= 1'b0;
                     end
                     default: begin
@@ -273,6 +301,9 @@ module ai_core #(
                     end
                 endcase
             end
+        end else begin
+            // While in power_down_mode, coprocessor interface remains quiescent
+            cmd_rd_valid <= 1'b0;
         end
     end
 
