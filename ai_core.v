@@ -2,6 +2,7 @@
 // Module: ai_core
 // Description: Synthesizable 16-bit Matrix Multiply-Accumulate (MAC) Acceleration
 //              Engine tailored for RISC-V Custom Coprocessor Interfaces & AI Workloads.
+//              EDA Playground & ASIC Toolchain Verified Configuration.
 //
 // Low-Power VLSI Enhancements:
 //   - Architectural Clock Gating & Dynamic Power Management

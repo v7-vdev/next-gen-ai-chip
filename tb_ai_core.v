@@ -182,8 +182,8 @@ module tb_ai_core;
         $display("Starting RISC-V AI Acceleration Core Hardware Verification ");
         $display("------------------------------------------------------------");
 
-        // Optional VCD dump for waveform visualizer
-        $dumpfile("ai_core_sim.vcd");
+        // EDA Playground & local waveform visualizer (EPWave) configuration
+        $dumpfile("dump.vcd");
         $dumpvars(0, tb_ai_core);
 
         clk          = 1'b0;
